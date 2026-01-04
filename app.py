@@ -6,207 +6,237 @@ from datetime import datetime, date
 from streamlit_gsheets import GSheetsConnection
 
 # -----------------------------------------------------------------------------
-# 1. 페이지 설정
+# 1. 페이지 설정 및 함수 정의
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="泰투자자문 포트폴리오",
+    page_title="투자자문 성과 비교 분석",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="expanded"
 )
 
-st.title("📈 泰투자자문 펀드 운용 현황")
+# 성과 지표 계산 함수 (재사용을 위해 함수로 분리)
+def calculate_metrics(daily_series, risk_free_rate=0.02):
+    if daily_series.empty:
+        return 0, 0, 0
+    
+    # 총 수익률
+    total_ret = ((daily_series.iloc[-1] - daily_series.iloc[0]) / daily_series.iloc[0]) * 100
+    
+    # MDD
+    rolling_max = daily_series.cummax()
+    drawdown = (daily_series - rolling_max) / rolling_max
+    mdd = drawdown.min() * 100
+    
+    # Sharpe
+    daily_pct = daily_series.pct_change().dropna()
+    if daily_pct.std() != 0:
+        sharpe = (daily_pct.mean() * 252 - risk_free_rate) / (daily_pct.std() * np.sqrt(252))
+    else:
+        sharpe = 0
+        
+    return total_ret, mdd, sharpe
+
+st.title("📈 펀드 성과 vs 벤치마크 비교")
 st.markdown("---")
 
 # -----------------------------------------------------------------------------
-# 2. 데이터 로드 및 전처리
+# 2. 데이터 로드 (내 포트폴리오 & 커스텀 벤치마크)
 # -----------------------------------------------------------------------------
 try:
     conn = st.connection("gsheets", type=GSheetsConnection)
-    df = conn.read(worksheet="Holdings", ttl=0) # ttl=0 : 캐시 없이 즉시 로딩
     
+    # 1) 내 포트폴리오 (Holdings)
+    df_port = conn.read(worksheet="Holdings", ttl=0)
+    
+    # 2) 커스텀 벤치마크 (Benchmark)
+    # 시트가 없을 수도 있으므로 예외처리
+    try:
+        df_bm_custom = conn.read(worksheet="Benchmark", ttl=0)
+    except:
+        df_bm_custom = pd.DataFrame()
+
     # 필수 컬럼 체크
-    required_cols = ['Ticker', 'Name', 'Quantity', 'AvgPrice', 'EntryDate']
-    if not all(col in df.columns for col in required_cols):
-        st.error("구글 시트 컬럼 부족. (Ticker, Name, Quantity, AvgPrice, EntryDate, ExitDate 확인 필요)")
+    if 'EntryDate' not in df_port.columns:
+        st.error("Holdings 시트에 EntryDate 컬럼이 필요합니다.")
         st.stop()
-
-    # ExitDate 컬럼이 아예 없으면 생성 (에러 방지)
-    if 'ExitDate' not in df.columns:
-        df['ExitDate'] = pd.NaT
-
-    # 날짜 형식 변환
-    df['EntryDate'] = pd.to_datetime(df['EntryDate'])
-    df['ExitDate'] = pd.to_datetime(df['ExitDate'])
+        
+    # 날짜 및 데이터 전처리
+    df_port['EntryDate'] = pd.to_datetime(df_port['EntryDate'])
+    if 'ExitDate' not in df_port.columns: df_port['ExitDate'] = pd.NaT
+    df_port['ExitDate'] = pd.to_datetime(df_port['ExitDate'])
     
-    # 현재 보유중인 종목 (ExitDate가 비어있거나 미래인 경우)
     today = pd.Timestamp(date.today())
-    df['IsHeld'] = df['ExitDate'].isna() | (df['ExitDate'] > today)
+    df_port['IsHeld'] = df_port['ExitDate'].isna() | (df_port['ExitDate'] > today)
 
 except Exception as e:
-    st.error(f"데이터 로드 실패: {e}")
+    st.error(f"구글 시트 로드 실패: {e}")
     st.stop()
 
 # -----------------------------------------------------------------------------
-# 3. 시장 데이터 수집 및 시계열 분석 엔진
+# 3. 사이드바: 벤치마크 선택
 # -----------------------------------------------------------------------------
-with st.spinner('전체 기간 데이터를 분석 중입니다...'):
-    tickers = df['Ticker'].unique().tolist()
-    USD_KRW = 1450.0  # 환율 설정
+st.sidebar.header("⚙️ 벤치마크 설정")
+
+# 시장 표준 벤치마크 정의
+market_indices = {
+    "S&P 500": "^GSPC",
+    "NASDAQ 100": "^NDX",
+    "KOSPI": "^KS11",
+    "KOSPI 200": "^KS200"
+}
+
+# 1. 시장 지수 선택
+selected_indices = st.sidebar.multiselect(
+    "시장 지수 비교",
+    options=list(market_indices.keys()),
+    default=["S&P 500", "KOSPI"]
+)
+
+# 2. 커스텀 벤치마크 활성화 여부
+use_custom_bm = False
+if not df_bm_custom.empty and 'Ticker' in df_bm_custom.columns and 'Weight' in df_bm_custom.columns:
+    use_custom_bm = st.sidebar.checkbox("커스텀 벤치마크(Sheet) 포함", value=True)
+
+# -----------------------------------------------------------------------------
+# 4. 데이터 수집 및 분석 엔진
+# -----------------------------------------------------------------------------
+with st.spinner('시장 데이터 수집 및 비교 분석 중...'):
+    # A. 내 펀드 데이터 수집
+    port_tickers = df_port['Ticker'].unique().tolist()
     
-    if len(tickers) > 0:
-        # 1. 전체 기간(가장 빠른 편입일 ~ 오늘) 데이터 가져오기
-        start_date = df['EntryDate'].min()
-        hist_data = yf.download(tickers, start=start_date, end=date.today())['Close']
-        
-        # 단일 종목일 경우 Series -> DataFrame 변환
-        if isinstance(hist_data, pd.Series):
-            hist_data = hist_data.to_frame(name=tickers[0])
-            
-        # 결측치 보간 (휴장일 등)
-        hist_data = hist_data.ffill().bfill()
-        
-        # ---------------------------------------------------------
-        # [핵심 로직] 일별 포트폴리오 가치 산출 (History Curve)
-        # ---------------------------------------------------------
-        # 날짜별 총 자산 가치를 담을 0으로 된 시리즈 생성
-        portfolio_series = pd.Series(0.0, index=hist_data.index)
-        
-        # 각 종목(행)별로 루프를 돌며 자산 가치를 더함
-        for idx, row in df.iterrows():
-            ticker = row['Ticker']
-            qty = row['Quantity']
-            entry = row['EntryDate']
-            exit_d = row['ExitDate']
-            
-            if ticker not in hist_data.columns:
-                continue # 티커 데이터가 없으면 스킵
+    # B. 벤치마크용 티커 수집
+    bm_tickers = [market_indices[name] for name in selected_indices]
+    if use_custom_bm:
+        bm_tickers += df_bm_custom['Ticker'].unique().tolist()
+    
+    # 전체 티커 합치기 (중복 제거)
+    all_tickers = list(set(port_tickers + bm_tickers))
+    USD_KRW = 1450.0 # 환율
 
-            # 해당 종목의 전체 가격 데이터
-            price_series = hist_data[ticker].copy()
+    if len(all_tickers) > 0:
+        # 데이터 시작일: 내 펀드 최초 편입일
+        start_date = df_port['EntryDate'].min()
+        
+        # 야후 파이낸스 다운로드
+        raw_data = yf.download(all_tickers, start=start_date, end=date.today())['Close']
+        if isinstance(raw_data, pd.Series): raw_data = raw_data.to_frame(name=all_tickers[0])
+        raw_data = raw_data.ffill().bfill()
+        
+        # -----------------------------------------------------
+        # (1) 내 펀드 NAV 계산 (이전 로직과 동일)
+        # -----------------------------------------------------
+        my_nav_series = pd.Series(0.0, index=raw_data.index)
+        
+        for idx, row in df_port.iterrows():
+            ticker = row['Ticker']
+            if ticker not in raw_data.columns: continue
             
-            # 환율 적용 (국내 주식이 아니면)
+            # 가격 데이터
+            price_s = raw_data[ticker].copy()
             if ".KS" not in ticker and ".KQ" not in ticker:
-                price_series = price_series * USD_KRW
-
-            # 유효 보유 기간 마스크 생성 (Entry <= Date <= Exit)
-            # ExitDate가 없으면(NaT) 오늘까지 보유한 것으로 처리
+                price_s = price_s * USD_KRW
+            
+            # 보유 기간 마스킹
+            entry, exit_d = row['EntryDate'], row['ExitDate']
             if pd.isna(exit_d):
-                mask = (price_series.index >= entry)
+                mask = (price_s.index >= entry)
             else:
-                mask = (price_series.index >= entry) & (price_series.index <= exit_d)
+                mask = (price_s.index >= entry) & (price_s.index <= exit_d)
             
-            # 보유 기간 동안의 가치 = 가격 * 수량
-            asset_value = price_series[mask] * qty
+            my_nav_series = my_nav_series.add(price_s[mask] * row['Quantity'], fill_value=0)
             
-            # 전체 포트폴리오에 합산 (인덱스 매칭되어 날짜별로 더해짐)
-            portfolio_series = portfolio_series.add(asset_value, fill_value=0)
+        # 0인 구간(투자 전) 제거
+        my_nav_series = my_nav_series[my_nav_series > 0]
+        if my_nav_series.empty:
+            st.warning("표시할 펀드 데이터가 없습니다.")
+            st.stop()
+            
+        # 비교를 위해 "누적 수익률(%)"로 변환 (시작일 = 0%)
+        # 내 펀드의 시작 날짜를 기준으로 모든 벤치마크를 자름
+        common_start_date = my_nav_series.index[0]
+        
+        # DataFrame for Plotting (모든 라인을 여기 담음)
+        chart_df = pd.DataFrame()
+        
+        # 1. 내 펀드 추가
+        my_return_curve = (my_nav_series / my_nav_series.iloc[0]) - 1
+        chart_df['My Fund'] = my_return_curve * 100
+        
+        # 메트릭 저장용 리스트
+        metrics_summary = []
+        ret, mdd, sharpe = calculate_metrics(my_nav_series)
+        metrics_summary.append(["My Fund", ret, mdd, sharpe])
 
-        # ---------------------------------------------------------
-        # 4. 현황 지표 계산 (현재 시점)
-        # ---------------------------------------------------------
-        
-        # A. 현재 운용 자산 (AUM): 현재 보유 중인 종목들의 평가액 합
-        # (마지막 날짜 기준 가격으로 계산)
-        current_prices = hist_data.iloc[-1]
-        
-        total_aum = 0
-        total_invested_active = 0 # 현재 보유분의 투자원금
-        
-        for idx, row in df[df['IsHeld']].iterrows():
-            ticker = row['Ticker']
-            if ticker in current_prices:
-                price = current_prices[ticker]
-                exchange = 1.0 if (".KS" in ticker or ".KQ" in ticker) else USD_KRW
-                val = price * row['Quantity'] * exchange
+        # -----------------------------------------------------
+        # (2) 시장 벤치마크 계산
+        # -----------------------------------------------------
+        for name in selected_indices:
+            ticker = market_indices[name]
+            if ticker in raw_data.columns:
+                # 내 펀드 시작일부터 슬라이싱
+                bm_series = raw_data[ticker][common_start_date:]
+                # 정규화
+                bm_curve = (bm_series / bm_series.iloc[0]) - 1
+                chart_df[name] = bm_curve * 100
                 
-                total_aum += val
-                total_invested_active += (row['AvgPrice'] * row['Quantity'])
+                # 메트릭 계산
+                ret, mdd, sharpe = calculate_metrics(bm_series)
+                metrics_summary.append([name, ret, mdd, sharpe])
 
-        # B. 실현 손익 (Realized PnL): 이미 매도한 종목들의 확정 손익
-        realized_pnl = 0
-        for idx, row in df[~df['IsHeld']].iterrows():
-            # 매도일의 가격 찾기
-            exit_date_lookup = row['ExitDate']
-            # 매도일이 데이터 범위 내에 있는지 확인 (휴장일이면 직전 평일 찾기)
-            if row['Ticker'] in hist_data.columns:
-                try:
-                    # asof: 해당 날짜 혹은 그 전 가장 가까운 날짜의 가격
-                    exit_price = hist_data[row['Ticker']].asof(exit_date_lookup)
-                    exchange = 1.0 if (".KS" in row['Ticker'] or ".KQ" in row['Ticker']) else USD_KRW
-                    
-                    sell_amt = exit_price * row['Quantity'] * exchange
-                    buy_amt = row['AvgPrice'] * row['Quantity']
-                    realized_pnl += (sell_amt - buy_amt)
-                except:
-                    pass # 데이터 매칭 실패 시 스킵
-
-        # C. 미실현 손익 (Unrealized PnL)
-        unrealized_pnl = total_aum - total_invested_active
-        
-        # D. 총 수익금 (실현 + 미실현)
-        total_profit = realized_pnl + unrealized_pnl
-
-        # MDD, Sharpe 계산
-        mdd_val = 0
-        sharpe_val = 0
-        
-        if not portfolio_series.empty and portfolio_series.max() > 0:
-            # MDD
-            rolling_max = portfolio_series.cummax()
-            drawdown = (portfolio_series - rolling_max) / rolling_max
-            mdd_val = drawdown.min() * 100
+        # -----------------------------------------------------
+        # (3) 커스텀 벤치마크 계산
+        # -----------------------------------------------------
+        if use_custom_bm:
+            # 100으로 시작하는 지수 산출 (Weighted Sum)
+            custom_bm_series = pd.Series(0.0, index=raw_data.index)
+            valid_weight = 0
             
-            # Sharpe
-            daily_ret = portfolio_series.pct_change().dropna()
-            if daily_ret.std() != 0:
-                sharpe_val = (daily_ret.mean() * 252 - 0.02) / (daily_ret.std() * np.sqrt(252))
-
-        # ---------------------------------------------------------
-        # 5. 화면 출력
-        # ---------------------------------------------------------
-        
-        # 메트릭 표시
-        col1, col2, col3, col4, col5 = st.columns(5)
-        col1.metric("현재 운용 자산 (AUM)", f"{total_aum:,.0f} 원")
-        col2.metric("총 실현 손익 (Realized)", f"{realized_pnl:,.0f} 원", 
-                    delta_color="normal" if realized_pnl >=0 else "inverse")
-        col3.metric("현재 평가 손익 (Unrealized)", f"{unrealized_pnl:,.0f} 원",
-                    delta_color="normal" if unrealized_pnl >=0 else "inverse")
-        col4.metric("MDD (History)", f"{mdd_val:.2f} %")
-        col5.metric("Sharpe Ratio", f"{sharpe_val:.2f}")
-
-        # 차트
-        st.subheader("📊 펀드 전체 자산 추이 (History)")
-        st.line_chart(portfolio_series, color="#FF4B4B")
-
-        # 테이블 1: 현재 보유 종목
-        st.subheader("🔵 현재 보유 포트폴리오")
-        if not df[df['IsHeld']].empty:
-            active_df = df[df['IsHeld']].copy()
-            # 현재가 매핑
-            active_df['CurPrice'] = active_df['Ticker'].map(lambda x: current_prices.get(x, 0))
-            active_df['Valuation'] = active_df.apply(
-                lambda r: r['CurPrice'] * r['Quantity'] * (1.0 if ".KS" in r['Ticker'] or ".KQ" in r['Ticker'] else USD_KRW), axis=1
-            )
-            active_df['Return'] = (active_df['Valuation'] - (active_df['AvgPrice']*active_df['Quantity'])) / (active_df['AvgPrice']*active_df['Quantity']) * 100
+            for idx, row in df_bm_custom.iterrows():
+                t, w = row['Ticker'], row['Weight']
+                if t in raw_data.columns:
+                    # 정규화된 가격(시작일=100)에 비중을 곱함 -> 리밸런싱 없는 고정비중 바스켓 가정
+                    normalized_price = raw_data[t] / raw_data[t].iloc[0] * 100
+                    custom_bm_series += (normalized_price * w)
+                    valid_weight += w
             
-            st.dataframe(active_df[['Name', 'Ticker', 'EntryDate', 'Quantity', 'AvgPrice', 'Valuation', 'Return']].style.format({
-                'AvgPrice': "{:,.0f}", 'Valuation': "{:,.0f}", 'Return': "{:+.2f}%", 'EntryDate': "{:%Y-%m-%d}"
-            }))
-        else:
-            st.info("현재 보유 중인 종목이 없습니다.")
+            if valid_weight > 0:
+                # 내 펀드 기간과 맞춤
+                custom_bm_series = custom_bm_series[common_start_date:]
+                bm_curve = (custom_bm_series / custom_bm_series.iloc[0]) - 1
+                chart_df['Custom BM'] = bm_curve * 100
+                
+                ret, mdd, sharpe = calculate_metrics(custom_bm_series)
+                metrics_summary.append(["Custom BM", ret, mdd, sharpe])
 
-        # 테이블 2: 청산 완료 종목
-        st.subheader("⚪️ 청산(매도) 완료 내역")
-        if not df[~df['IsHeld']].empty:
-            exited_df = df[~df['IsHeld']].copy()
-            # 매도 당시 가격 추정 로직 (단순화를 위해 마지막 날짜 기준이 아닌, ExitDate 기준)
-            # 여기서는 편의상 리스트엔 표시만 함
-            st.dataframe(exited_df[['Name', 'Ticker', 'EntryDate', 'ExitDate', 'Quantity', 'AvgPrice']].style.format({
-                'AvgPrice': "{:,.0f}", 'EntryDate': "{:%Y-%m-%d}", 'ExitDate': "{:%Y-%m-%d}"
-            }))
-        else:
-            st.info("청산된 종목 내역이 없습니다.")
+        # -----------------------------------------------------
+        # 5. 시각화 및 표출
+        # -----------------------------------------------------
+        
+        # A. 성과 요약 테이블
+        st.subheader("📊 성과 비교 요약")
+        metrics_df = pd.DataFrame(metrics_summary, columns=["구분", "총 수익률(%)", "MDD(%)", "Sharpe"])
+        
+        # 스타일링 (수익률 높고, MDD 낮은 순으로 강조하면 좋겠지만 단순 표출)
+        st.dataframe(
+            metrics_df.style.format({
+                "총 수익률(%)": "{:+.2f}%",
+                "MDD(%)": "{:.2f}%",
+                "Sharpe": "{:.2f}"
+            }).background_gradient(subset=['총 수익률(%)'], cmap='RdYlGn'),
+            hide_index=True,
+            use_container_width=True
+        )
+        
+        # B. 비교 차트
+        st.subheader("📈 누적 수익률 추이 비교")
+        # 색상 지정 (내 펀드는 빨강, 나머지는 자동)
+        st.line_chart(chart_df, color=["#FF0000"] + ["#AAAAAA"]*(len(chart_df.columns)-1))
+        
+        # C. (옵션) 상관관계 분석
+        with st.expander("상관관계 분석 (Correlation) 보기"):
+            st.write("내 펀드와 벤치마크 간의 움직임이 얼마나 비슷한지(0~1) 보여줍니다.")
+            corr_matrix = chart_df.pct_change().corr()
+            st.dataframe(corr_matrix.style.background_gradient(cmap='coolwarm', axis=None).format("{:.2f}"))
 
     else:
-        st.warning("종목 데이터가 없습니다.")
+        st.warning("데이터를 불러올 수 없습니다.")
