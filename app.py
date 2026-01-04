@@ -5,9 +5,9 @@ import numpy as np
 from datetime import datetime
 
 # 1. 페이지 설정
-st.set_page_config(page_title="OO투자자문 성과분석", layout="wide")
+st.set_page_config(page_title="SD투자자문 성과분석", layout="wide")
 
-st.title("📈 OO투자자문 펀드 현황")
+st.title("📈 SD투자자문 펀드 현황")
 st.markdown("---")
 
 # 2. 구글 시트 데이터 가져오기 (여기서는 예시 데이터를 직접 넣지만, 실제론 연동 코드가 들어갑니다)
