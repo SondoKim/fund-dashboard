@@ -3,3 +3,4 @@ pandas
 yfinance
 openpyxl
 st-gsheets-connection
+matplotlib
