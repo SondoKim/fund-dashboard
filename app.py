@@ -9,7 +9,7 @@ from streamlit_gsheets import GSheetsConnection
 # 1. 페이지 설정 및 함수 정의
 # -----------------------------------------------------------------------------
 st.set_page_config(
-    page_title="투자자문 성과 분석",
+    page_title="APKA 투자자문 성과 분석",
     layout="wide",
     initial_sidebar_state="expanded"
 )
